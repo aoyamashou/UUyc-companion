@@ -1,4 +1,4 @@
-// 监听 UU 被控状态：UURemoteServer 被控时会在各屏铺覆盖窗口（CGWindowList 可见，无需权限）
+// 合并覆盖窗口与 UU 被控设备表格，兼容没有覆盖窗口的远控会话。
 import CoreGraphics
 import Foundation
 
@@ -8,9 +8,9 @@ final class UUMonitor {
     private(set) var connected = false
 
     private var timer: Timer?
-    private var lastSeen = Date.distantPast
-    /// 切换主屏时覆盖窗口会短暂重建，断开需持续缺席这么久才算数
-    private let debounce: TimeInterval = 1.5
+    private var session = UUConnectionState()
+    private let readerQueue = DispatchQueue(label: "uudisplay.controller-reader", qos: .utility)
+    private var readInFlight = false
 
     static func overlayPresent() -> Bool {
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -23,18 +23,40 @@ final class UUMonitor {
     }
 
     private func tick() {
-        let now = Date()
-        if UUMonitor.overlayPresent() {
-            lastSeen = now
-            if !connected {
-                connected = true
-                Log.info("检测到 UU 连入")
-                onConnect?()
+        guard UUReader.isTrusted else {
+            apply(controllers: nil)
+            return
+        }
+        // AX 调用可能阻塞；后台串行读取且不堆积任务。
+        guard !readInFlight else { return }
+        readInFlight = true
+        let started = Date()
+        readerQueue.async { [weak self] in
+            let controllers = UUReader.readControllers()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.readInFlight = false
+                // 不使用延迟过久的界面快照确认连接。
+                self.apply(controllers: Date().timeIntervalSince(started) <= 2 ? controllers : nil)
             }
-        } else if connected, now.timeIntervalSince(lastSeen) > debounce {
+        }
+    }
+
+    private func apply(controllers: [String]?) {
+        switch session.update(overlay: UUMonitor.overlayPresent(), controllers: controllers, now: Date()) {
+        case .connected:
+            connected = true
+            Log.info("检测到 UU 连入（覆盖窗口或被控设备表格）")
+            onConnect?()
+        case .controllerChanged:
+            Log.info("检测到 UU 控制端变化")
+            onConnect?()
+        case .disconnected:
             connected = false
             Log.info("检测到 UU 断开")
             onDisconnect?()
+        case nil:
+            break
         }
     }
 }
