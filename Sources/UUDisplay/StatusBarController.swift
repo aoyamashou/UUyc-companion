@@ -43,6 +43,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         let status = NSMenuItem(title: coordinator.statusText, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+        if coordinator.display.wedged {
+            let retry = action("重试还原显示器布局", #selector(retryLayout))
+            retry.isEnabled = coordinator.canRetryLayout
+            menu.addItem(retry)
+        }
         menu.addItem(.separator())
 
         let physical = action("远程时只保留虚拟屏", #selector(toggleDisablePhysical))
@@ -61,6 +66,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func reconfigure() { openSettings(nil) }
+
+    @objc private func retryLayout() { coordinator.retryLayoutRestore() }
 
     @objc private func toggleDisablePhysical() { coordinator.setDisablePhysical(!store.config.shouldDisablePhysical) }
 

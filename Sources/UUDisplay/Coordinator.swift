@@ -22,6 +22,7 @@ final class Coordinator {
 
     func start() {
         display.shouldDisablePhysical = { [weak self] in self?.physicalDisableAllowed ?? false }
+        display.onChange = { [weak self] in self?.onChange?() }
         display.recoverIfNeeded()
         monitor.onConnect = { [weak self] in self?.handleConnect() }
         monitor.onDisconnect = { [weak self] in self?.handleDisconnect() }
@@ -34,7 +35,11 @@ final class Coordinator {
     }
 
     var statusText: String {
-        if display.wedged { return "⛔️ 屏幕设置无响应，请重启 Mac" }
+        if display.wedged {
+            if display.retryingLayout { return "正在重试还原显示器布局…" }
+            return canRetryLayout ? "⚠️ 屏幕设置已暂停，可重试布局还原"
+                : "⚠️ 屏幕设置已暂停，请断开远程后重试或重开伴侣"
+        }
         if store.config.paused { return "虚拟屏已暂停：连接时不做调整" }
         guard connected else { return "等待其它设备连接中" }
         let who = controllerName ?? "未知设备"
@@ -47,6 +52,7 @@ final class Coordinator {
     // MARK: - 事件
 
     func handleConnect() {
+        display.cancelLayoutRetry()
         connectedAt = Date()
         controllerName = nil
         openedUUWindow = false
@@ -128,6 +134,14 @@ final class Coordinator {
     }
 
     // MARK: - 菜单操作
+
+    var canRetryLayout: Bool { !connected && display.canRetryLayout }
+
+    func retryLayoutRestore() {
+        guard !connected else { return }
+        display.retryLayoutRestore()
+        onChange?()
+    }
 
     func setPaused(_ paused: Bool) {
         store.config.paused = paused
