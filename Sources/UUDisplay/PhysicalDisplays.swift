@@ -44,12 +44,44 @@ enum PhysicalDisplays {
         return applyDisplayConfig { cfg in ids.forEach { _ = setEnabled(cfg, $0, false) } }
     }
 
+    static func enableDisplays(_ ids: [CGDirectDisplayID]) -> CGError {
+        guard let setEnabled else { return .failure }
+        var cfg: CGDisplayConfigRef?
+        let begin = CGBeginDisplayConfiguration(&cfg)
+        guard begin == .success else { return begin }
+        for id in ids {
+            let error = setEnabled(cfg, id, true)
+            guard error == .success else {
+                CGCancelDisplayConfiguration(cfg)
+                return error
+            }
+        }
+        let error = CGCompleteDisplayConfiguration(cfg, .forSession)
+        if error != .success { CGCancelDisplayConfiguration(cfg) }
+        return error
+    }
+
+    static func isAlreadyActive(_ id: CGDirectDisplayID) -> Bool {
+        // 查询失败/无 WindowServer 连接时返回值可能为 -1，只接受明确的 1。
+        CGDisplayIsOnline(id) == 1 && CGDisplayIsActive(id) == 1
+    }
+
     /// 按记录重新启用物理屏；成功后删除记录。可在任意进程调用，重复调用无害
     @discardableResult
-    static func restore(reason: String) -> Bool {
+    static func restore(reason: String,
+                        isActive: (CGDirectDisplayID) -> Bool = isAlreadyActive,
+                        enable: ([CGDirectDisplayID]) -> CGError = enableDisplays) -> Bool {
         guard let ids = pending else { return true }
-        guard let setEnabled else { return false }
-        let err = applyDisplayConfig { cfg in ids.forEach { _ = setEnabled(cfg, $0, true) } }
+        // 看门狗或系统可能已经恢复了屏幕。对已经在线且激活的 ID 再执行
+        // 私有启用事务可能失败，不能因此永远卡在启动恢复阶段。
+        let remaining = ids.filter { !isActive($0) }
+        if remaining.isEmpty {
+            do { try FileManager.default.removeItem(at: markerURL) }
+            catch { Log.info("⚠️ 无法清理物理屏恢复记录：\(error)"); return false }
+            Log.info("✅ 物理屏已处于激活状态，清理残留记录（\(reason)）")
+            return true
+        }
+        let err = enable(remaining)
         if err == .success {
             try? FileManager.default.removeItem(at: markerURL)
             Log.info("✅ 已恢复物理屏 \(ids)（\(reason)）")

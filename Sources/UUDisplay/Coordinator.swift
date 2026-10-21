@@ -14,6 +14,8 @@ final class Coordinator {
     private var namePoll: Timer?
     private var connectedAt = Date.distantPast
     private var openedUUWindow = false
+    private var lastNameAttempt = Date.distantPast
+    private var warnedNameDelay = false
 
     /// 调试：模拟连入的控制端名称（不读 UU）
     var simulatedName: String?
@@ -47,6 +49,10 @@ final class Coordinator {
     // MARK: - 事件
 
     func handleConnect() {
+        namePoll?.invalidate()
+        namePoll = nil
+        lastNameAttempt = .distantPast
+        warnedNameDelay = false
         connectedAt = Date()
         controllerName = nil
         openedUUWindow = false
@@ -73,13 +79,17 @@ final class Coordinator {
         guard connected, !store.config.paused else { return true }
         let elapsed = Date().timeIntervalSince(connectedAt)
 
+        // 前 30 秒快速重试，之后每 5 秒继续等待；权限/界面稍晚就绪仍能恢复。
+        let interval: TimeInterval = elapsed >= 30 ? 5 : 0.5
+        guard Date().timeIntervalSince(lastNameAttempt) >= interval else { return false }
+        lastNameAttempt = Date()
         if let name = simulatedName ?? readControllerName() {
             resolve(name)
             return true
         }
-        if elapsed >= 30 {
-            Log.info("30 秒内未读到控制端名称，停止等待")
-            return true
+        if elapsed >= 30, !warnedNameDelay {
+            warnedNameDelay = true
+            Log.info("30 秒内未读到控制端名称，改为每 5 秒继续重试")
         }
         return false
     }
@@ -90,9 +100,8 @@ final class Coordinator {
         case .none:
             // 主窗口没开：打开一次 UU 主界面再读
             if !openedUUWindow {
-                openedUUWindow = true
                 Log.info("UU 主窗口未打开，尝试打开以读取控制端名称")
-                UUReader.showMainWindow()
+                openedUUWindow = UUReader.showMainWindow()
             }
             return nil
         case .some(let names):
