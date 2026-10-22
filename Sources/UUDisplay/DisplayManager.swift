@@ -10,6 +10,43 @@ import CGVirtualDisplayBridge
 import CoreGraphics
 import Foundation
 
+/// 建屏前记录的物理屏状态：位置 + 显示模式（分辨率）。
+/// 只记位置不够：会话期间 UU 远程或系统可能改掉物理屏分辨率，
+/// 断开后必须按原样恢复，否则会掉到系统默认的 1920×1080。
+struct SavedDisplayState: Codable {
+    var x: Double
+    var y: Double
+    var width: Int
+    var height: Int
+    var pixelWidth: Int
+    var pixelHeight: Int
+    var refreshRate: Double
+
+    init(origin: CGPoint, mode: CGDisplayMode) {
+        x = origin.x
+        y = origin.y
+        width = mode.width
+        height = mode.height
+        pixelWidth = mode.pixelWidth
+        pixelHeight = mode.pixelHeight
+        refreshRate = mode.refreshRate
+    }
+
+    /// 兼容旧版 session.json 的 [x, y] 格式（只有位置）
+    init?(legacy: [Double]) {
+        guard legacy.count == 2 else { return nil }
+        x = legacy[0]
+        y = legacy[1]
+        width = 0
+        height = 0
+        pixelWidth = 0
+        pixelHeight = 0
+        refreshRate = 0
+    }
+
+    var hasMode: Bool { width > 0 && height > 0 }
+}
+
 final class DisplayManager {
     static let vendorID: UInt32 = 0x5555
 
@@ -31,8 +68,8 @@ final class DisplayManager {
     private var broken: [CGVirtualDisplay] = []
     /// 同一配置创建失败后不再重试，直到目标变化
     private var failedCfg: DeviceConfig?
-    /// 建屏前各物理屏的原点，用于还原
-    private var savedOrigins: [CGDirectDisplayID: CGPoint] = [:]
+    /// 建屏前各物理屏的位置与分辨率，用于还原
+    private var savedStates: [CGDirectDisplayID: SavedDisplayState] = [:]
 
     // 执行器
     private var busy = false
@@ -44,6 +81,10 @@ final class DisplayManager {
     /// WindowServer 显示配置无响应（事务超时）：停止建屏/删屏/改布局
     private(set) var wedged = false
     static let minLifetime: TimeInterval = 2.5
+    /// 两次建屏的最小间隔：打断「建屏→改拓扑→误判断开→拆屏→再建屏」的自激振荡。
+    /// 每次建屏都会让 WindowServer/ColorSync 重新枚举显示设备，高频循环会把 CPU 打满。
+    static let minCreateInterval: TimeInterval = 8
+    private var lastCreatedAt = Date.distantPast
     private let cgQueue = DispatchQueue(label: "uudisplay.display-config")
 
     private static let markerURL = ConfigStore.dir.appendingPathComponent("session.json")
@@ -60,6 +101,29 @@ final class DisplayManager {
     }
 
     static func isVirtual(_ id: CGDirectDisplayID) -> Bool { CGDisplayVendorNumber(id) == vendorID }
+
+    /// 记录当前所有物理屏的原点与显示模式（须在创建虚拟屏之前调用）
+    static func capturePhysicalStates() -> [CGDirectDisplayID: SavedDisplayState] {
+        var states: [CGDirectDisplayID: SavedDisplayState] = [:]
+        for id in onlineDisplays() where !isVirtual(id) {
+            guard let mode = CGDisplayCopyDisplayMode(id) else { continue }
+            states[id] = SavedDisplayState(origin: CGDisplayBounds(id).origin, mode: mode)
+        }
+        return states
+    }
+
+    /// 由设备配置派生的稳定序列号（FNV-1a 32 位）。
+    /// 不能用 Swift 的 Hasher：它每次进程启动都会随机加盐，跨进程不稳定。
+    static func stableSerial(for cfg: DeviceConfig) -> UInt32 {
+        var hash: UInt32 = 2_166_136_261
+        let key = "\(cfg.name)|\(cfg.width)x\(cfg.height)|\(cfg.hiDPI ? 1 : 0)"
+        for byte in key.utf8 {
+            hash ^= UInt32(byte)
+            hash = hash &* 16_777_619
+        }
+        let serial = hash % 0xFFFF_FFF0
+        return serial == 0 ? 1 : serial
+    }
 
     private static func same(_ a: DeviceConfig?, _ b: DeviceConfig?) -> Bool {
         guard let a, let b else { return a == nil && b == nil }
@@ -96,12 +160,19 @@ final class DisplayManager {
     /// 启动时：读回上次未收尾的布局记录；残留的物理屏禁用记录由执行器按「目标=无」自动恢复
     func recoverIfNeeded() {
         if let data = try? Data(contentsOf: DisplayManager.markerURL),
-           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: [Double]] {
-            for (k, v) in dict where v.count == 2 {
-                if let id = UInt32(k) { savedOrigins[id] = CGPoint(x: v[0], y: v[1]) }
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for (k, v) in dict {
+                guard let id = UInt32(k) else { continue }
+                if let legacy = v as? [Double], let state = SavedDisplayState(legacy: legacy) {
+                    savedStates[id] = state
+                } else if let obj = v as? [String: Any],
+                          let d = try? JSONSerialization.data(withJSONObject: obj),
+                          let state = try? JSONDecoder().decode(SavedDisplayState.self, from: d) {
+                    savedStates[id] = state
+                }
             }
         }
-        if !savedOrigins.isEmpty || physicalOff {
+        if !savedStates.isEmpty || physicalOff {
             Log.info("发现上次异常退出的残留状态，先恢复物理屏与显示器布局")
             recovering = true
         }
@@ -188,11 +259,11 @@ final class DisplayManager {
                 release(&all)
                 return finish(settle: 1.5)
             }
-            if !savedOrigins.isEmpty {
-                let origins = savedOrigins
-                savedOrigins = [:]
+            if !savedStates.isEmpty {
+                let states = savedStates
+                savedStates = [:]
                 try? FileManager.default.removeItem(at: DisplayManager.markerURL)
-                return runCG(settle: 0.5) { DisplayManager.restoreOrigins(origins) }
+                return runCG(settle: 0.5) { DisplayManager.restoreStates(states) }
             }
             if recovering {
                 recovering = false
@@ -209,7 +280,24 @@ final class DisplayManager {
         // 目标=某设备的虚拟屏
         if vd == nil || !DisplayManager.same(current, want) {
             guard !DisplayManager.same(failedCfg, want) else { return }
+            // 建屏冷却：UU 覆盖窗口在改显示拓扑时会短暂重建，若「断开→连入」来回抖动，
+            // 会形成 建屏→改拓扑→误判断开→拆屏→再建屏 的自激振荡。
+            // 每次建屏都会新增一次显示设备枚举（旧版本还会多落一个 ICC profile），必须限速。
+            let sinceLast = Date().timeIntervalSince(lastCreatedAt)
+            if sinceLast < DisplayManager.minCreateInterval {
+                busy = true
+                return finish(settle: DisplayManager.minCreateInterval - sinceLast)
+            }
             busy = true
+            // 必须在建屏前记录：虚拟屏一出现，macOS 会把物理屏模式也切到虚拟屏的分辨率，
+            // 之后再记录就会把「虚拟屏尺寸」当成用户原来的分辨率，导致断开后恢复错。
+            if savedStates.isEmpty {
+                savedStates = DisplayManager.capturePhysicalStates()
+                let summary = savedStates.map { "#\($0.key) \($0.value.width)×\($0.value.height)@\(Int($0.value.refreshRate))" }
+                    .joined(separator: ", ")
+                Log.info("已记录物理屏原始分辨率：\(summary.isEmpty ? "(无物理屏)" : summary)")
+                writeMarker()
+            }
             if let old = vd { retiring.append(old) }
             vd = nil
             current = nil
@@ -226,10 +314,6 @@ final class DisplayManager {
                 if waitOnlineTries > 20 { Log.info("⚠️ 虚拟屏 5 秒内未上线"); mainSet = true }
                 busy = true
                 return finish(settle: 0.25)
-            }
-            if savedOrigins.isEmpty {
-                savedOrigins = Dictionary(uniqueKeysWithValues: online.filter { !DisplayManager.isVirtual($0) }
-                    .map { ($0, CGDisplayBounds($0).origin) })
             }
             writeMarker()
             mainSet = true
@@ -272,6 +356,7 @@ final class DisplayManager {
     // MARK: - 单步操作
 
     private func createDisplay(_ cfg: DeviceConfig) -> Bool {
+        lastCreatedAt = Date()
         let w = cfg.width, h = cfg.height
         let desc = CGVirtualDisplayDescriptor()
         desc.name = "UUyc companion · \(cfg.name)"  // 显示在 UU 的多显示屏列表、系统显示器设置中
@@ -280,10 +365,20 @@ final class DisplayManager {
         desc.sizeInMillimeters = CGSize(width: Double(w) / 220 * 25.4, height: Double(h) / 220 * 25.4)
         desc.vendorID = DisplayManager.vendorID
         desc.productID = 0x0001
-        // 每次随机序列号：与残留虚拟屏同序列号时 CGVirtualDisplay 会返回 nil
-        desc.serialNum = UInt32.random(in: 1...0xFFFF_FFF0)
+        // 稳定序列号：同一台控制设备永远对应同一个显示器身份。
+        // 旧实现每次建屏都随机 serialNum，macOS 会当成一台全新显示器，在
+        // /Library/ColorSync/Profiles/Displays 生成新的 ICC profile 且从不回收；
+        // 反复建屏后目录膨胀到上百个文件，colorsyncd / colorsync.useragent 枚举时 CPU 打满。
+        desc.serialNum = DisplayManager.stableSerial(for: cfg)
 
-        let created: CGVirtualDisplay? = autoreleasepool { CGVirtualDisplay(descriptor: desc) }
+        var created: CGVirtualDisplay? = autoreleasepool { CGVirtualDisplay(descriptor: desc) }
+        if created == nil {
+            // 同序列号仍与系统中残留的同身份虚拟屏冲突时（极少数），退回随机序列号保证功能可用；
+            // 只有这一种情况会多出一个 ICC profile。
+            Log.info("⚠️ 稳定序列号 \(desc.serialNum) 创建失败，退回随机序列号重试")
+            desc.serialNum = UInt32.random(in: 1...0xFFFF_FFF0)
+            created = autoreleasepool { CGVirtualDisplay(descriptor: desc) }
+        }
         guard let display = created else {
             Log.info("❌ 创建虚拟屏失败（CGVirtualDisplay 返回 nil）")
             return false
@@ -312,19 +407,51 @@ final class DisplayManager {
         Log.info("✅ 已移除虚拟屏 \(ids)")
     }
 
-    private static func restoreOrigins(_ origins: [CGDirectDisplayID: CGPoint]) -> CGError {
+    /// 还原物理屏：先把分辨率恢复成建屏前记下的模式，再恢复位置。
+    /// 只还原位置会让分辨率停在系统默认值（例如 1920×1080）。
+    private static func restoreStates(_ states: [CGDirectDisplayID: SavedDisplayState]) -> CGError {
         let online = Set(onlineDisplays())
-        let targets = origins.filter { online.contains($0.key) }
+        let targets = states.filter { online.contains($0.key) }
         guard !targets.isEmpty else { return .success }
-        let err = applyDisplayConfig { cfg in
-            for (id, o) in targets { CGConfigureDisplayOrigin(cfg, id, Int32(o.x), Int32(o.y)) }
+
+        // 把「保存时的分辨率」解析成当前仍可用的 CGDisplayMode
+        var resolved: [CGDirectDisplayID: CGDisplayMode] = [:]
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        for (id, state) in targets where state.hasMode {
+            let all = CGDisplayCopyAllDisplayModes(id, options) as? [CGDisplayMode] ?? []
+            resolved[id] = all.first { mode in
+                mode.width == state.width
+                    && mode.height == state.height
+                    && mode.pixelWidth == state.pixelWidth
+                    && mode.pixelHeight == state.pixelHeight
+                    && abs(mode.refreshRate - state.refreshRate) < 0.5
+            }
+            if resolved[id] == nil {
+                Log.info("⚠️ 未找到 #\(id) 的原始分辨率 \(state.width)×\(state.height)，仅还原位置")
+            }
         }
-        Log.info(err == .success ? "✅ 已还原显示器布局" : "⚠️ 还原布局 CGError=\(err.rawValue)")
+
+        let err = applyDisplayConfig { cfg in
+            for (id, state) in targets {
+                if let mode = resolved[id] {
+                    CGConfigureDisplayWithDisplayMode(cfg, id, mode, nil)
+                }
+                CGConfigureDisplayOrigin(cfg, id, Int32(state.x), Int32(state.y))
+            }
+        }
+        if err == .success {
+            let restored = targets.map { "#\($0.key) \($0.value.width)×\($0.value.height)" }.joined(separator: ", ")
+            Log.info("✅ 已还原显示器分辨率与布局：\(restored)")
+        } else {
+            Log.info("⚠️ 还原布局 CGError=\(err.rawValue)")
+        }
         return err
     }
 
     private func writeMarker() {
-        let dict = Dictionary(uniqueKeysWithValues: savedOrigins.map { ("\($0.key)", [$0.value.x, $0.value.y]) })
-        try? JSONSerialization.data(withJSONObject: dict).write(to: DisplayManager.markerURL, options: .atomic)
+        let dict = Dictionary(uniqueKeysWithValues: savedStates.map { ("\($0.key)", $0.value) })
+        if let data = try? JSONEncoder().encode(dict) {
+            try? data.write(to: DisplayManager.markerURL, options: .atomic)
+        }
     }
 }

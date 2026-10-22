@@ -24,13 +24,14 @@ enum Log { static func info(_ message: String) {} }
         monitor.onDisconnect = { disconnects += 1 }
         monitor.start()
         let heartbeat = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in pulses += 1 }
-        RunLoop.main.run(until: Date().addingTimeInterval(0.7))
+        // 连入需持续确认 1.5s（防覆盖窗口抖动），因此这里要等过确认窗口
+        RunLoop.main.run(until: Date().addingTimeInterval(1.9))
         precondition(connects == 1, "覆盖窗口检测不能等待 AX 返回")
+        lock.lock(); let count = reads; lock.unlock()
+        precondition(count == 1, "AX 读取不能堆积或并发")
         overlay = false
         RunLoop.main.run(until: Date().addingTimeInterval(1.9))
         precondition(disconnects == 1, "AX 阻塞时仍应按覆盖窗口缺席触发断开")
-        lock.lock(); let count = reads; lock.unlock()
-        precondition(count == 1, "AX 读取不能堆积或并发")
         RunLoop.main.run(until: Date().addingTimeInterval(0.8))
         precondition(connects == 1, "过期的 AX 结果不能重新触发连接")
         precondition(pulses >= 30, "AX 读取不能阻塞主线程")
