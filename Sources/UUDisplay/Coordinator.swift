@@ -11,9 +11,6 @@ final class Coordinator {
     var onChange: (() -> Void)?
 
     private(set) var controllerName: String?
-    private var namePoll: Timer?
-    private var connectedAt = Date.distantPast
-    private var openedUUWindow = false
 
     /// 调试：模拟连入的控制端名称（不读 UU）
     var simulatedName: String?
@@ -22,9 +19,11 @@ final class Coordinator {
 
     func start() {
         display.shouldDisablePhysical = { [weak self] in self?.physicalDisableAllowed ?? false }
+        display.onChange = { [weak self] in self?.onChange?() }
         display.recoverIfNeeded()
         monitor.onConnect = { [weak self] in self?.handleConnect() }
         monitor.onDisconnect = { [weak self] in self?.handleDisconnect() }
+        monitor.onControllersRead = { [weak self] in self?.updateControllerFromSnapshot() }
         monitor.start()
     }
 
@@ -34,7 +33,12 @@ final class Coordinator {
     }
 
     var statusText: String {
-        if display.wedged { return "⛔️ 屏幕设置无响应，请重启 Mac" }
+        if display.waitingForDisplayWake { return "屏幕休眠中，唤醒后继续还原布局" }
+        if display.wedged {
+            if display.retryingLayout { return "正在重试还原显示器布局…" }
+            return canRetryLayout ? "⚠️ 屏幕设置已暂停，可重试布局还原"
+                : "⚠️ 屏幕设置已暂停，请断开远程后重试或重开伴侣"
+        }
         if store.config.paused { return "虚拟屏已暂停：连接时不做调整" }
         guard connected else { return "等待其它设备连接中" }
         let who = controllerName ?? "未知设备"
@@ -47,56 +51,26 @@ final class Coordinator {
     // MARK: - 事件
 
     func handleConnect() {
-        connectedAt = Date()
+        display.setRemoteConnected(true)
+        display.cancelLayoutRetry()
         controllerName = nil
-        openedUUWindow = false
         onChange?()
-        guard !store.config.paused else { return }
-        if pollName() { return }
-        namePoll?.invalidate()
-        namePoll = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] t in
-            guard let self else { return t.invalidate() }
-            if self.pollName() { t.invalidate() }
-        }
+        updateControllerFromSnapshot()
     }
 
     func handleDisconnect() {
-        namePoll?.invalidate()
-        namePoll = nil
+        display.setRemoteConnected(false)
         display.remove()
         controllerName = nil
         onChange?()
     }
 
-    /// 返回 true 表示已拿到名称、无需继续轮询
-    private func pollName() -> Bool {
-        guard connected, !store.config.paused else { return true }
-        let elapsed = Date().timeIntervalSince(connectedAt)
-
-        if let name = simulatedName ?? readControllerName() {
-            resolve(name)
-            return true
-        }
-        if elapsed >= 30 {
-            Log.info("30 秒内未读到控制端名称，停止等待")
-            return true
-        }
-        return false
-    }
-
-    private func readControllerName() -> String? {
-        guard UUReader.isTrusted else { return nil }
-        switch UUReader.readControllers() {
-        case .none:
-            // 主窗口没开：打开一次 UU 主界面再读
-            if !openedUUWindow {
-                openedUUWindow = true
-                Log.info("UU 主窗口未打开，尝试打开以读取控制端名称")
-                UUReader.showMainWindow()
-            }
-            return nil
-        case .some(let names):
-            return names.first
+    private func updateControllerFromSnapshot() {
+        guard connected, !store.config.paused else { return }
+        if let name = simulatedName ?? monitor.controllerName {
+            if name != controllerName { resolve(name) }
+        } else {
+            monitor.requestMainWindowIfNeeded()
         }
     }
 
@@ -129,10 +103,17 @@ final class Coordinator {
 
     // MARK: - 菜单操作
 
+    var canRetryLayout: Bool { !connected && display.canRetryLayout }
+
+    func retryLayoutRestore() {
+        guard !connected else { return }
+        display.retryLayoutRestore()
+        onChange?()
+    }
+
     func setPaused(_ paused: Bool) {
         store.config.paused = paused
         if paused {
-            namePoll?.invalidate()
             display.remove()
         } else if connected {
             handleConnect()
@@ -162,6 +143,8 @@ final class Coordinator {
     }
 
     func shutdown(completion: @escaping () -> Void) {
+        monitor.stop()
+        display.setRemoteConnected(false)
         display.remove(completion: completion)
     }
 }

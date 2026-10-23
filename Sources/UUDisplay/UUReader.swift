@@ -34,18 +34,35 @@ enum UUReader {
     private static func role(_ el: AXUIElement) -> String? { attr(el, kAXRoleAttribute) as? String }
     private static func value(_ el: AXUIElement) -> String? { attr(el, kAXValueAttribute) as? String }
 
-    /// 先序遍历；UU 的 AX 树存在环，必须限制深度
-    private static func flatten(_ el: AXUIElement, depth: Int = 0, into out: inout [AXUIElement]) {
-        guard depth < 25 else { return }
-        out.append(el)
-        for k in (attr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? [] {
-            flatten(k, depth: depth + 1, into: &out)
+    /// 有环的 AX 树按对象去重；只持有本次读取的有限节点，不做跨轮次树缓存。
+    @discardableResult
+    private static func flatten(_ el: AXUIElement, depth: Int = 0, into out: inout [AXUIElement]) -> Bool {
+        var seen = Set(out)
+        func walk(_ node: AXUIElement, _ level: Int) -> Bool {
+            guard !seen.contains(node) else { return true }
+            guard level < 25, out.count < 2048 else { return false }
+            seen.insert(node)
+            out.append(node)
+            for child in (attr(node, kAXChildrenAttribute) as? [AXUIElement]) ?? [] {
+                guard walk(child, level + 1) else { return false }
+            }
+            return true
         }
+        return walk(el, depth)
     }
 
     private static func windows() -> [AXUIElement] {
         guard let ax = appElement() else { return [] }
-        return (attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+        var result = (attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+        // 其他 App 占用全屏 Space 时，UU 的 AXWindows 可能为空，主窗口引用仍有效。
+        // 同时读取这两个根节点，不激活 UU、不切换 Space；按 AX 对象身份去重。
+        for key in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+            guard let raw = attr(ax, key), CFGetTypeID(raw) == AXUIElementGetTypeID() else { continue }
+            let window = raw as! AXUIElement
+            guard role(window) == kAXWindowRole, !result.contains(where: { CFEqual($0, window) }) else { continue }
+            result.append(window)
+        }
+        return result
     }
 
     static var hasMainWindow: Bool { !windows().isEmpty }
@@ -67,7 +84,7 @@ enum UUReader {
         let wins = windows()
         guard !wins.isEmpty else { return nil }
         var all: [AXUIElement] = []
-        wins.forEach { flatten($0, into: &all) }
+        guard wins.allSatisfy({ flatten($0, into: &all) }) else { return nil }
 
         var group: Bool?  // true = 电脑组
         var pendingIcon = false
@@ -113,11 +130,11 @@ enum UUReader {
         let wins = windows()
         guard !wins.isEmpty else { return nil }
         var all: [AXUIElement] = []
-        wins.forEach { flatten($0, into: &all) }
+        guard wins.allSatisfy({ flatten($0, into: &all) }) else { return nil }
         var names: [String] = []
         for row in all where role(row) == kAXRowRole {
             var inner: [AXUIElement] = []
-            flatten(row, into: &inner)
+            guard flatten(row, into: &inner) else { return nil }
             let texts = inner.filter { role($0) == kAXStaticTextRole }.compactMap { value($0) }
             // 只接受带「远程控制」标记的行，避免其他表格误触发连入。
             guard texts.contains("远程控制") else { continue }
