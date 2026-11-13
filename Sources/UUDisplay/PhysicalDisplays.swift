@@ -55,7 +55,42 @@ enum PhysicalDisplays {
             Log.info("✅ 已恢复物理屏 \(ids)（\(reason)）")
             return true
         }
-        Log.info("⚠️ 恢复物理屏失败 CGError=\(err.rawValue)（\(reason)），稍后重试")
+
+        // 批量恢复失败时（常见于其中混有已断开/重排失效的 Display ID，返回 CGError=1001），
+        // 退回逐个恢复，并剔除已失效的 ID，避免整批卡死后续流程
+        var restored: [CGDirectDisplayID] = []
+        var stale: [CGDirectDisplayID] = []
+        var remaining: [CGDirectDisplayID] = []
+        var lastError = err
+        for id in ids {
+            let singleErr = applyDisplayConfig { _ = setEnabled($0, id, true) }
+            switch singleErr {
+            case .success:
+                restored.append(id)
+            case .illegalArgument:
+                stale.append(id)
+            default:
+                remaining.append(id)
+                lastError = singleErr
+            }
+        }
+
+        if remaining.isEmpty {
+            try? FileManager.default.removeItem(at: markerURL)
+            if !restored.isEmpty && !stale.isEmpty {
+                Log.info("✅ 已恢复物理屏 \(restored)，并清理失效 ID \(stale)（\(reason)）")
+            } else if !restored.isEmpty {
+                Log.info("✅ 已恢复物理屏 \(restored)（\(reason)）")
+            } else {
+                Log.info("⚠️ 残留物理屏 ID \(stale) 已失效，已清理记录（\(reason)）")
+            }
+            return true
+        }
+
+        if remaining.count != ids.count {
+            try? JSONEncoder().encode(remaining).write(to: markerURL, options: .atomic)
+        }
+        Log.info("⚠️ 恢复物理屏失败 CGError=\(lastError.rawValue)（\(reason)），剩余 \(remaining) 稍后重试")
         return false
     }
 }
